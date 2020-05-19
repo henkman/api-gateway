@@ -35,14 +35,39 @@ func main() {
 			Services               map[string]Service     `json:"services"`
 			SwaggerUIConfiguration SwaggerUIConfiguration `json:"swaggerUI"`
 		}
-		fd, err := os.Open("application.json")
-		if err != nil {
-			panic(err)
-		}
-		err = json.NewDecoder(fd).Decode(&config)
-		fd.Close()
-		if err != nil {
-			panic(err)
+		cloudConfig := os.Getenv("SPRING_CLOUD_URI")
+		if cloudConfig != "" {
+			req, err := http.NewRequest("GET", cloudConfig, nil)
+			if err != nil {
+				panic(err)
+			}
+			user := os.Getenv("SPRING_CLOUD_USER")
+			if user != "" {
+				req.SetBasicAuth(user, os.Getenv("SPRING_CLOUD_PASSWORD"))
+			}
+			cli := http.Client{
+				Timeout: 3 * time.Second,
+			}
+			resp, err := cli.Do(req)
+			if err != nil {
+				resp.Body.Close()
+				panic(err)
+			}
+			err = json.NewDecoder(resp.Body).Decode(&config)
+			resp.Body.Close()
+			if err != nil {
+				panic(err)
+			}
+		} else {
+			fd, err := os.Open("application.json")
+			if err != nil {
+				panic(err)
+			}
+			err = json.NewDecoder(fd).Decode(&config)
+			fd.Close()
+			if err != nil {
+				panic(err)
+			}
 		}
 
 		swaggerResources := make([]SwaggerResource, 0, len(config.Services))
@@ -186,13 +211,17 @@ type SwaggerUIConfiguration struct {
 }
 
 type BasicAuth struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Credentials
 }
 
 func (ba *BasicAuth) IsAuthorized(r *http.Request) bool {
 	username, password, ok := r.BasicAuth()
 	return ok && ba.Username == username && ba.Password == password
+}
+
+type Credentials struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 type Service struct {
