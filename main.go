@@ -1,16 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
-	"net/http/httputil"
 	"os"
-	"sync"
+	"strings"
 	"time"
 
-	"github.com/rs/cors"
+	cors "github.com/AdhityaRamadhanus/fasthttpcors"
+	"github.com/fasthttp/router"
+	"github.com/valyala/fasthttp"
 )
 
 func main() {
@@ -22,7 +26,7 @@ func main() {
 		basicAuth                   BasicAuth
 		swaggerResourcesBytes       []byte
 		swaggerUIConfigurationBytes []byte
-		c                           *cors.Cors
+		c                           *cors.CorsHandler
 	)
 	{
 		var config struct {
@@ -100,7 +104,7 @@ func main() {
 		services = config.Services
 		basicAuth = config.BasicAuth
 
-		c = cors.New(cors.Options{
+		c = cors.NewCorsHandler(cors.Options{
 			AllowedOrigins:   config.AllowedOrigins,
 			AllowedMethods:   config.AllowedMethods,
 			AllowedHeaders:   config.AllowedHeaders,
@@ -108,80 +112,67 @@ func main() {
 			Debug:            false,
 		})
 	}
-
-	var mux http.ServeMux
-	mux.HandleFunc("/swagger-resources", func(w http.ResponseWriter, r *http.Request) {
-		if !basicAuth.IsAuthorized(r) {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-			http.Error(w, "", http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("content-type", "application/json")
-		w.Write(swaggerResourcesBytes)
-	})
-	mux.HandleFunc("/swagger-resources/configuration/ui", func(w http.ResponseWriter, r *http.Request) {
-		if !basicAuth.IsAuthorized(r) {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-			http.Error(w, "", http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("content-type", "application/json")
-		w.Write(swaggerUIConfigurationBytes)
-	})
-	mux.HandleFunc("/swagger-resources/configuration/security", func(w http.ResponseWriter, r *http.Request) {
-		if !basicAuth.IsAuthorized(r) {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-			http.Error(w, "", http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("content-type", "application/json")
-		w.Write([]byte("{}"))
-	})
-	mux.HandleFunc("/swagger-ui.html", func(w http.ResponseWriter, r *http.Request) {
-		if !basicAuth.IsAuthorized(r) {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-			http.Error(w, "", http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("content-type", "text/html")
-		http.ServeFile(w, r, "swagger-ui.html")
-	})
-	mux.Handle("/swagger-ui-resources/",
-		http.StripPrefix("/swagger-ui-resources",
-			http.FileServer(http.Dir("./swagger-ui-resources"))))
-	var buffers Buffers
+	mux := router.New()
+	mux.GET("/swagger-resources",
+		func(ctx *fasthttp.RequestCtx) {
+			if !basicAuth.IsAuthorized(&ctx.Request) {
+				ctx.Response.Header.Set(
+					fasthttp.HeaderWWWAuthenticate, `Basic realm="Restricted"`)
+				ctx.SetStatusCode(fasthttp.StatusUnauthorized)
+				return
+			}
+			ctx.Response.Header.Set(
+				fasthttp.HeaderContentType, "application/json")
+			ctx.SetBody(swaggerResourcesBytes)
+		})
+	mux.GET("/swagger-resources/configuration/ui",
+		func(ctx *fasthttp.RequestCtx) {
+			if !basicAuth.IsAuthorized(&ctx.Request) {
+				ctx.Response.Header.Set(
+					fasthttp.HeaderWWWAuthenticate, `Basic realm="Restricted"`)
+				ctx.SetStatusCode(fasthttp.StatusUnauthorized)
+				return
+			}
+			ctx.Response.Header.Set(
+				fasthttp.HeaderContentType, "application/json")
+			ctx.SetBody(swaggerUIConfigurationBytes)
+		})
+	mux.GET("/swagger-resources/configuration/security",
+		func(ctx *fasthttp.RequestCtx) {
+			if !basicAuth.IsAuthorized(&ctx.Request) {
+				ctx.Response.Header.Set(
+					fasthttp.HeaderWWWAuthenticate, `Basic realm="Restricted"`)
+				ctx.SetStatusCode(fasthttp.StatusUnauthorized)
+				return
+			}
+			ctx.Response.Header.Set(
+				fasthttp.HeaderContentType, "application/json")
+			ctx.SetBodyString("{}")
+		})
+	mux.GET("/swagger-ui.html",
+		func(ctx *fasthttp.RequestCtx) {
+			if !basicAuth.IsAuthorized(&ctx.Request) {
+				ctx.Response.Header.Set(
+					fasthttp.HeaderWWWAuthenticate, `Basic realm="Restricted"`)
+				ctx.SetStatusCode(fasthttp.StatusUnauthorized)
+				return
+			}
+			ctx.Response.Header.Set(
+				fasthttp.HeaderContentType, "text/html")
+			ctx.SendFile("swagger-ui.html")
+		})
+	mux.ServeFiles("/swagger-ui-resources/{filepath:*}",
+		"./swagger-ui-resources")
 	for name, service := range services {
-		serviceBase := routeBase + name
-		mux.Handle(serviceBase+"/", reverseProxy(serviceBase, service.Url, &buffers))
+		ep := routeBase + name
+		proxy := MakePrefixedReverseProxy(len(ep), service.Url)
+		mux.ANY(ep+"/{path:*}", proxy.Handler)
 	}
 	log.Println("started in", time.Since(start), "and listening at", listen)
-	if err := http.ListenAndServe(listen, c.Handler(&mux)); err != nil {
-		panic(err)
+	if err := fasthttp.ListenAndServe(
+		listen, c.CorsMiddleware(mux.Handler)); err != nil {
+		log.Fatal(err)
 	}
-}
-
-type Buffers struct {
-	pool sync.Pool
-}
-
-func (bs *Buffers) Get() []byte {
-	if b := bs.pool.Get(); b != nil {
-		return b.([]byte)
-	}
-	return make([]byte, 32*1024)
-}
-
-func (bs *Buffers) Put(b []byte) {
-	bs.pool.Put(b)
-}
-
-func reverseProxy(serviceBase, url string, buffers httputil.BufferPool) *httputil.ReverseProxy {
-	return &httputil.ReverseProxy{Director: func(r *http.Request) {
-		r.Header.Set("X-Forwarded-Prefix", serviceBase)
-		r.URL.Path = r.URL.Path[len(serviceBase):]
-		r.URL.Host = url
-		r.URL.Scheme = "http"
-	}, BufferPool: buffers}
 }
 
 type SwaggerResource struct {
@@ -214,9 +205,20 @@ type BasicAuth struct {
 	Credentials
 }
 
-func (ba *BasicAuth) IsAuthorized(r *http.Request) bool {
-	username, password, ok := r.BasicAuth()
-	return ok && ba.Username == username && ba.Password == password
+func (ba *BasicAuth) IsAuthorized(r *fasthttp.Request) bool {
+	auth := r.Header.Peek(fasthttp.HeaderAuthorization)
+	if len(auth) < 6 || !bytes.Equal(bytes.ToLower(auth[:5]), []byte("basic")) {
+		return false
+	}
+	b64 := string(auth[6:])
+	if raw, err := base64.StdEncoding.DecodeString(b64); err == nil {
+		cred := string(raw)
+		colon := strings.IndexByte(cred, ':')
+		if ba.Username == cred[:colon] && ba.Password == cred[colon+1:] {
+			return true
+		}
+	}
+	return false
 }
 
 type Credentials struct {
@@ -226,4 +228,60 @@ type Credentials struct {
 
 type Service struct {
 	Url string `json:"url"`
+}
+
+type PrefixedReverseProxy struct {
+	prefixLength int
+	client       fasthttp.HostClient
+}
+
+func MakePrefixedReverseProxy(prefixLength int, target string) PrefixedReverseProxy {
+	return PrefixedReverseProxy{
+		prefixLength: prefixLength,
+		client:       fasthttp.HostClient{Addr: target},
+	}
+}
+
+func (proxy PrefixedReverseProxy) Handler(ctx *fasthttp.RequestCtx) {
+	req := &ctx.Request
+	if host, _, err := net.SplitHostPort(ctx.RemoteAddr().String()); err == nil {
+		req.Header.Add("X-Forwarded-For", host)
+	}
+	reqUri := req.RequestURI()
+	req.Header.AddBytesV("X-Forwarded-Prefix", reqUri[:proxy.prefixLength])
+	req.SetRequestURIBytes(reqUri[proxy.prefixLength:])
+	for _, h := range hopHeaders {
+		req.Header.Del(h)
+	}
+	res := &ctx.Response
+	resHeaders := make(map[string]string)
+	res.Header.VisitAll(func(k, v []byte) {
+		key := string(k)
+		value := string(v)
+		if val, ok := resHeaders[key]; ok {
+			resHeaders[key] = val + "," + value
+		}
+		resHeaders[key] = value
+	})
+	if err := proxy.client.Do(req, res); err != nil {
+		res.SetStatusCode(fasthttp.StatusBadGateway)
+	}
+	for _, h := range hopHeaders {
+		res.Header.Del(h)
+	}
+	for k, v := range resHeaders {
+		res.Header.Set(k, v)
+	}
+}
+
+var hopHeaders = []string{
+	"Connection",
+	"Proxy-Connection", // non-standard but still sent by libcurl and rejected by e.g. google
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",      // canonicalized version of "TE"
+	"Trailer", // not Trailers per URL above; https://www.rfc-editor.org/errata_search.php?eid=4522
+	"Transfer-Encoding",
+	"Upgrade",
 }
