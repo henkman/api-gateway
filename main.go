@@ -210,9 +210,12 @@ func (ba *BasicAuth) IsAuthorized(r *fasthttp.Request) bool {
 	if len(auth) < 6 || !bytes.Equal(bytes.ToLower(auth[:5]), []byte("basic")) {
 		return false
 	}
-	b64 := string(auth[6:])
-	if raw, err := base64.StdEncoding.DecodeString(b64); err == nil {
-		cred := string(raw)
+	b64 := auth[6:]
+	enc := base64.StdEncoding
+	dbuf := make([]byte, enc.DecodedLen(len(b64)))
+	n, err := enc.Decode(dbuf, b64)
+	if err == nil {
+		cred := string(dbuf[:n])
 		colon := strings.IndexByte(cred, ':')
 		if ba.Username == cred[:colon] && ba.Password == cred[colon+1:] {
 			return true
