@@ -9,15 +9,25 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"time"
 
-	cors "github.com/AdhityaRamadhanus/fasthttpcors"
 	"github.com/fasthttp/router"
+	cors "github.com/henkman/fasthttpcors"
+	"github.com/pkg/profile"
 	"github.com/valyala/fasthttp"
 )
 
 func main() {
+	clean := make(chan os.Signal)
+	go func() {
+		p := profile.Start(profile.CPUProfile, profile.ProfilePath("."), profile.NoShutdownHook)
+		<-clean
+		p.Stop()
+		os.Exit(0)
+	}()
+	signal.Notify(clean, os.Kill, os.Interrupt)
 	start := time.Now()
 	var (
 		listen                      string
@@ -109,7 +119,7 @@ func main() {
 			AllowedMethods:   config.AllowedMethods,
 			AllowedHeaders:   config.AllowedHeaders,
 			AllowCredentials: true,
-			Debug:            false,
+			Debug:            true,
 		})
 	}
 	mux := router.New()
@@ -168,11 +178,38 @@ func main() {
 		proxy := MakePrefixedReverseProxy(len(ep), service.Url)
 		mux.ANY(ep+"/{path:*}", proxy.Handler)
 	}
+	lh := LoggingHandler{Next: c.CorsMiddleware(mux.Handler)}
+	server := fasthttp.Server{
+		NoDefaultServerHeader: true,
+		NoDefaultContentType:  true,
+		NoDefaultDate:         true,
+		Handler:               lh.Handler,
+	}
 	log.Println("started in", time.Since(start), "and listening at", listen)
-	if err := fasthttp.ListenAndServe(
-		listen, c.CorsMiddleware(mux.Handler)); err != nil {
+	if err := server.ListenAndServe(listen); err != nil {
 		log.Fatal(err)
 	}
+}
+
+type LoggingHandler struct {
+	Next fasthttp.RequestHandler
+}
+
+func (lh *LoggingHandler) Handler(ctx *fasthttp.RequestCtx) {
+	fmt.Println(string(ctx.Method()), ctx.Request.URI())
+	ctx.Request.Header.VisitAll(func(k, v []byte) {
+		key := string(k)
+		value := string(v)
+		fmt.Println(key, value)
+	})
+	fmt.Println("++++")
+	lh.Next(ctx)
+	ctx.Response.Header.VisitAll(func(k, v []byte) {
+		key := string(k)
+		value := string(v)
+		fmt.Println(key, value)
+	})
+	fmt.Println("####")
 }
 
 type SwaggerResource struct {
